@@ -819,6 +819,14 @@ class Spec:
         scope.update(self.scope)
         return scope[glom](target, self.spec, scope)
 
+    def build(self):
+        """Build phase: return an inspectable :class:`~glom.SpecPlan`
+        of this spec, listing the paths it accesses and branches it
+        contains.
+        """
+        from glom.plan import build
+        return build(self)
+
     def __repr__(self):
         cn = self.__class__.__name__
         if self.scope:

@@ -503,6 +503,11 @@ def test_all_public_errors():
 
     _test_exc(TypeMatchError, 1, Match(str))
 
+    plan_target, plan_spec = {'user': {}}, {'user_id': 'user.id'}
+    with pytest.raises(glom.PlanError) as exc_info:
+        glom.build(plan_spec).glom(plan_target)
+    results.append((plan_target, plan_spec, exc_info.value))
+
     for (target, spec, exc) in results:
         assert copy.copy(exc) is not exc
         exc_str = str(exc)

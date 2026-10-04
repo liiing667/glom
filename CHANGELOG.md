@@ -12,6 +12,16 @@ The glom team's approach to updates can be summed up as:
 Check this page when upgrading, we strive to keep the updates
 summarized and well-linked.
 
+## Unreleased
+
+* Add a spec build phase in the new ``glom.plan`` module: ``glom.build(spec)``
+  (and ``Spec.build()``) returns an inspectable ``SpecPlan`` listing every
+  path a spec accesses (``SpecPlan.paths``) and every branch it may take
+  (``SpecPlan.branches``), each annotated with its origin. ``SpecPlan.glom()``
+  executes the plan and raises ``PlanError`` on failure, annotating the
+  original error with the normalized path and the branch that produced it,
+  so string, ``Path``, and ``T`` specs report access errors identically.
+
 ## 25.12.0
 
 _(December 28, 2025)_
