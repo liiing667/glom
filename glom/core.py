@@ -815,6 +815,26 @@ class Spec:
         glom_ = scope.get(glom, glom)
         return glom_(target, self.spec, **kw)
 
+    def build(self):
+        """Build this spec into an inspectable, executable
+        :class:`SpecPlan`. Building does not touch any data: it walks
+        the spec structure once and records which paths will be
+        accessed and where the branching points are.
+
+        >>> spec = Spec({'user_id': 'user.id',
+        ...              'tags': Coalesce('tags', default=[])})
+        >>> plan = spec.build()
+        >>> plan.paths
+        (Path('user', 'id'), Path('tags'))
+        >>> len(plan.branches)
+        1
+        >>> plan.glom({'user': {'id': 1}})
+        {'user_id': 1, 'tags': []}
+
+        See :class:`SpecPlan` for details.
+        """
+        return SpecPlan(self.spec, scope=self.scope)
+
     def glomit(self, target, scope):
         scope.update(self.scope)
         return scope[glom](target, self.spec, scope)
@@ -2593,3 +2613,329 @@ def arg_val(target, arg, scope):
     result = scope[glom](target, arg, scope)
     scope[MIN_MODE] = mode
     return result
+
+
+# ---------------------------------------------------------------------------
+# Spec building / execution separation
+# ---------------------------------------------------------------------------
+#
+# Building a spec walks it once, without any data, and produces a
+# SpecPlan: a tree of PlanNode objects recording the data paths that
+# will be accessed, the branching points (Coalesce), the containers
+# (dict/list/tuple), and the opaque/leaf pieces.
+#
+# Execution still goes through the regular glom machinery, so results
+# are identical, but errors raised from a built plan are normalized:
+# the same access written as a string, Path, or T expression reports
+# the same Path on PathAccessError.
+
+
+class PlanNode:
+    """Base class for nodes in a :class:`SpecPlan` tree.
+
+    Each node holds the original *spec* fragment plus its direct
+    *children*. The aggregate introspection properties (:attr:`paths`
+    and :attr:`branches`) collect information from the node and all
+    of its descendants.
+    """
+    kind = 'node'
+
+    def __init__(self, spec, children=()):
+        self.spec = spec
+        self.children = tuple(children)
+
+    @property
+    def paths(self):
+        """A tuple of :class:`Path` objects accessed by this node and
+        its descendants, in first-seen order (deduplicated)."""
+        ret = []
+        for child in self.children:
+            for path in child.paths:
+                if path not in ret:
+                    ret.append(path)
+        return tuple(ret)
+
+    @property
+    def branches(self):
+        """A tuple of :class:`BranchNode` objects found among this
+        node and its descendants, in first-seen order."""
+        ret = []
+        for child in self.children:
+            for branch in child.branches:
+                if branch not in ret:
+                    ret.append(branch)
+        return tuple(ret)
+
+    def describe(self, indent=0):
+        """Render this node (and its descendants) as an indented
+        human-readable string."""
+        lines = ['  ' * indent + self._describe_self()]
+        lines.extend(child.describe(indent + 1) for child in self.children)
+        return '\n'.join(lines)
+
+    def _describe_self(self):
+        return '%s: %s' % (self.kind, bbrepr(self.spec))
+
+    def __repr__(self):
+        return '%s(%s)' % (self.__class__.__name__, bbrepr(self.spec))
+
+
+class StructNode(PlanNode):
+    """A node for dict/list/tuple/set specs.
+
+    *keys* is aligned with :attr:`children`: for dicts it holds the
+    output field names, for sequences it holds integer positions.
+    """
+    kind = 'struct'
+
+    def __init__(self, spec, children, keys):
+        super(StructNode, self).__init__(spec, children)
+        self.keys = tuple(keys)
+
+    def describe(self, indent=0):
+        lines = ['  ' * indent + self._describe_self()]
+        for key, child in zip(self.keys, self.children):
+            lines.append('  ' * (indent + 1) + '%r:' % (key,))
+            lines.append(child.describe(indent + 2))
+        return '\n'.join(lines)
+
+
+class PathNode(PlanNode):
+    """A leaf node representing one data :class:`Path` access.
+
+    The same access written as ``'a.b'``, ``Path('a', 'b')``, or
+    ``T['a']['b']`` builds to an equal PathNode, so spellings are
+    indistinguishable after building.
+    """
+    kind = 'path'
+
+    def __init__(self, spec, path):
+        super(PathNode, self).__init__(spec)
+        self.path = path
+
+    @property
+    def paths(self):
+        return (self.path,)
+
+    def _describe_self(self):
+        return 'path: %r' % (self.path,)
+
+    def __repr__(self):
+        return 'PathNode(%r)' % (self.path,)
+
+
+class BranchNode(PlanNode):
+    """A branching point, produced by :class:`Coalesce` (and similar
+    branching specifier types). :attr:`options` is the tuple of
+    alternative sub-plans, one per subspec."""
+    kind = 'branch'
+
+    def __init__(self, spec, options):
+        super(BranchNode, self).__init__(spec, options)
+
+    @property
+    def options(self):
+        return self.children
+
+    @property
+    def branches(self):
+        ret = [self]
+        for child in self.children:
+            for branch in child.branches:
+                if branch not in ret:
+                    ret.append(branch)
+        return tuple(ret)
+
+    def _describe_self(self):
+        return 'branch: %s (%d %s)' % (
+            bbrepr(self.spec), len(self.children),
+            'option' if len(self.children) == 1 else 'options')
+
+
+class LeafNode(PlanNode):
+    """A node that does not access any data paths. *role* is one of:
+
+    - ``'literal'``: a plain value (or a :class:`Val`), returned as-is
+    - ``'call'``: a callable applied to the current target
+    - ``'opaque'``: a specifier the builder cannot walk into
+      (calls/arithmetic on T, Check, Switch, ...)
+    """
+    kind = 'leaf'
+
+    def __init__(self, spec, role):
+        super(LeafNode, self).__init__(spec)
+        self.role = role
+
+    def _describe_self(self):
+        return 'leaf (%s): %s' % (self.role, bbrepr(self.spec))
+
+    def __repr__(self):
+        return 'LeafNode(%s, %r)' % (self.role, bbrepr(self.spec))
+
+
+def _t_as_path(t):
+    """Return the canonical :class:`Path` for a pure-access
+    :data:`T` expression, or None if it contains calls, arithmetic,
+    or is rooted at :data:`S`/:data:`A`."""
+    ops = t.__ops__
+    if ops[0] is not T:
+        return None
+    access_ops = ops[1::2]
+    if not access_ops or any(op not in ('.', '[', 'P') for op in access_ops):
+        return None
+    return Path(*ops[2::2])
+
+
+def _plan_node(spec, mode):
+    if isinstance(spec, Spec):
+        return _plan_node(spec.spec, mode)
+    if isinstance(spec, Fill):
+        return _plan_node(spec.spec, FILL)
+    if isinstance(spec, Auto):
+        return _plan_node(spec.spec, AUTO)
+    if isinstance(spec, Coalesce):
+        return BranchNode(spec, [_plan_node(sub, mode) for sub in spec.subspecs])
+    if isinstance(spec, Path):
+        return PathNode(spec, spec)
+    if isinstance(spec, TType):
+        path = _t_as_path(spec)
+        if path is not None:
+            return PathNode(spec, path)
+        return LeafNode(spec, 'opaque')
+    if isinstance(spec, Val):
+        return LeafNode(spec, 'literal')
+    if mode is FILL:
+        if type(spec) in (dict, list, tuple, set, frozenset):
+            keys, children = _plan_struct(spec, FILL)
+            return StructNode(spec, children, keys)
+        if callable(spec):
+            return LeafNode(spec, 'call')
+        return LeafNode(spec, 'literal')
+    if type(spec) is str:
+        return PathNode(spec, Path.from_text(spec))
+    if isinstance(spec, dict):
+        keys, children = _plan_struct(spec, AUTO)
+        return StructNode(spec, children, keys)
+    if isinstance(spec, (list, tuple)):
+        keys, children = _plan_struct(spec, AUTO)
+        return StructNode(spec, children, keys)
+    if callable(spec):
+        return LeafNode(spec, 'call')
+    if _has_callable_glomit(spec):
+        return LeafNode(spec, 'opaque')
+    return LeafNode(spec, 'literal')
+
+
+def _plan_struct(spec, mode):
+    if isinstance(spec, dict):
+        keys = list(spec.keys())
+        children = [_plan_node(spec[key], mode) for key in keys]
+    else:
+        keys = range(len(spec))
+        children = [_plan_node(sub, mode) for sub in spec]
+    return keys, children
+
+
+class SpecPlan:
+    """An inspectable, executable structure produced by building a
+    spec with :meth:`Spec.build` (or ``SpecPlan(spec)`` directly).
+
+    A :class:`SpecPlan` separates the two phases of glom processing:
+
+    1. **Building** walks the spec once, with no data, recording the
+       paths that will be accessed and the branches that may be
+       taken. The walk is mode-aware: strings are data paths in
+       default mode, but plain literals inside a :class:`Fill`, so
+       the plan surfaces spec fragments that will never access data
+       (a common source of silent ``None`` defaults).
+    2. **Execution** (:meth:`glom`) evaluates the original spec with
+       the standard glom machinery -- results are identical to a
+       direct call -- but normalizes errors so that the same access
+       expressed as a string, :class:`Path`, or :data:`T` reports the
+       same canonical :class:`Path` on a
+       :exc:`PathAccessError`.
+
+    >>> spec = Spec({'user_id': 'user.id',
+    ...              'tags': Coalesce('tags', default=[])})
+    >>> plan = spec.build()
+    >>> plan.paths
+    (Path('user', 'id'), Path('tags'))
+    >>> branch = plan.branches[0]
+    >>> branch  # doctest: +ELLIPSIS
+    BranchNode(Coalesce(...))
+    >>> branch.options[0].path
+    Path('tags')
+    >>> plan.glom({'user': {'id': 7}})
+    {'user_id': 7, 'tags': []}
+
+    Use :meth:`describe` for a text view of the full plan tree.
+    """
+    def __init__(self, spec, scope=None):
+        self.spec = spec
+        self.scope = dict(scope or {})
+        self.root = _plan_node(spec, AUTO)
+
+    @property
+    def paths(self):
+        """All :class:`Path` objects this plan will access, in
+        first-seen order (deduplicated)."""
+        return self.root.paths
+
+    @property
+    def branches(self):
+        """All :class:`BranchNode` branching points in this plan, in
+        first-seen order."""
+        return self.root.branches
+
+    def describe(self):
+        """Render the whole plan tree as a human-readable string."""
+        return self.root.describe()
+
+    def glom(self, target, **kw):
+        """Execute the plan against *target*. Identical in result to
+        ``glom(target, spec)``, but :exc:`PathAccessError` paths are
+        normalized to canonical :class:`Path` objects (including for
+        the individual access errors carried on a
+        :exc:`CoalesceError`).
+
+        Takes the same keyword arguments as :func:`glom` (``default``,
+        ``skip_exc``, ``scope``, ...).
+        """
+        scope = dict(self.scope)
+        scope.update(kw.pop('scope', None) or {})
+        if scope:
+            kw['scope'] = scope
+        try:
+            return glom(target, self.spec, **kw)
+        except CoalesceError as ce:
+            for skipped in ce.skipped:
+                if isinstance(skipped, PathAccessError):
+                    _normalize_pae_path(skipped)
+            raise
+        except PathAccessError as pae:
+            _normalize_pae_path(pae)
+            raise
+
+    def __repr__(self):
+        return 'SpecPlan(%s)' % bbrepr(self.spec)
+
+
+def _normalize_pae_path(pae):
+    """Rewrite a PathAccessError's path to the canonical
+    Path-of-plain-values form, so string, Path, and T spellings of
+    the same access produce the same error path and message."""
+    path = pae.path
+    try:
+        values = path.values()
+    except (AttributeError, TypeError):
+        return
+    try:
+        norm_path = Path(*values)
+    except Exception:
+        return
+    if (type(path) is Path
+            and path.path_t.__ops__ == norm_path.path_t.__ops__):
+        return
+    pae.path = norm_path
+    pae.__dict__.pop('_finalized_str', None)
+    pae.__dict__.pop('_target_spec_trace', None)

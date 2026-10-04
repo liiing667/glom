@@ -51,6 +51,12 @@ types that can be used with the basic set of Python builtins.
 .. autoclass:: glom.Path
 .. autoclass:: glom.Val
 .. autoclass:: glom.Spec
+.. autoclass:: glom.SpecPlan
+
+   A plan's tree is made up of node types exposed as
+   :class:`glom.PlanNode`, :class:`glom.StructNode`,
+   :class:`glom.PathNode`, :class:`glom.BranchNode`, and
+   :class:`glom.LeafNode`.
 
 .. _advanced-specifiers:
 
